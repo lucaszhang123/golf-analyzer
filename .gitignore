@@ -1,0 +1,9 @@
+*.mov
+*.mp4
+*.avi
+*.MP4
+*.MOV
+output/
+__pycache__/
+*.pyc
+.DS_Store
