@@ -165,6 +165,7 @@ class BackAnalyzer:
         save_snapshot_images: bool = True,
         show_progress: bool = True,
         out_dir: str = "output/back",
+        run_faults: bool = True,
     ) -> BackResult:
 
         cap = cv2.VideoCapture(video_path)
@@ -242,50 +243,31 @@ class BackAnalyzer:
 
         cap.release()
         self._last_landmarks = all_landmarks
+        # Stash metrics so callers can serialize them without re-running pose.
+        self._last_metrics = all_metrics
 
-        # --- Fault detection ---
-        if show_progress:
-            print("  Running DTL fault detection...")
+        # --- Fault detection (optional) ---
+        if run_faults:
+            if show_progress:
+                print("  Running DTL fault detection...")
 
-        a = _arrays(all_metrics)
-        addr_f, top_f, impact_f = _find_phases(a)
+            from .syndrome_engine import SyndromeEngine
+            engine = SyndromeEngine(all_metrics, view="back")
+            phases = engine._phases
+            addr_f = phases.get("addr_idx", 0)
+            top_f  = phases.get("top_idx",  0)
+            imp_f  = phases.get("impact_idx", 0)
+            deduped = engine.detected()
 
-        faults = []
-        for check_fn in BACK_FAULT_CHECKS:
-            try:
-                res = check_fn(all_metrics)
-                if res is not None and res.severity > 0.05:
-                    faults.append(res)
-            except Exception as e:
-                print(f"  Warning: {check_fn.__name__} failed: {e}")
+            result.report = BackReport(
+                faults=deduped,
+                address_frame=addr_f,
+                top_frame=top_f,
+                impact_frame=imp_f,
+            )
 
-        # Dedup
-        DUPE_GROUPS = [
-            {"back_early_extension", "back_spine_loss"},
-        ]
-        seen = []
-        deduped = []
-        for f in sorted(faults, key=lambda x: x.severity, reverse=True):
-            in_group = False
-            for g in DUPE_GROUPS:
-                if f.name in g:
-                    if g in seen:
-                        in_group = True
-                        break
-                    seen.append(g)
-                    break
-            if not in_group:
-                deduped.append(f)
-
-        result.report = BackReport(
-            faults=deduped,
-            address_frame=addr_f,
-            top_frame=top_f,
-            impact_frame=impact_f,
-        )
-
-        if show_progress:
-            print(result.report.summary())
+            if show_progress:
+                print(result.report.summary())
 
         # --- Snapshot images ---
         out_dir = Path(out_dir)

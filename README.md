@@ -19,7 +19,8 @@ pip3 install mediapipe opencv-python numpy
 
 ```
 golf_analyzer/
-├── main.py                    ← entry point, run this
+├── main.py                    ← step 1: capture pose, metrics, stick videos
+├── faults.py                  ← step 2: run fault detection on a session
 ├── README.md
 ├── your_video.mov             ← put your videos here
 └── core/
@@ -41,79 +42,136 @@ golf_analyzer/
 
 ## How to Run
 
-### Basic analysis (face view)
+The pipeline is split into **two steps**:
+
+1. **`main.py`** — capture step. Extracts pose, snapshots, stick figure videos,
+   and writes per-frame metrics to `metrics.json`. **No fault detection runs
+   here.**
+2. **`faults.py`** — analysis step. Reads the captured session and runs fault
+   detection (and optionally LLM coaching feedback) on whichever views are
+   present.
+
+This means you can capture once and re-run fault analysis as many times as you
+want (e.g. with a different club, with/without AI feedback) without
+re-processing video.
+
+### Step 1 — Capture (recommended: both views at once)
 ```bash
-python3 main.py swing.mov
+python3 main.py --face swing.mov --back swing_back.mov --club 7i
 ```
 
-### Basic analysis (back view)
+This creates the next free `output/sessionN/` and writes:
+- `output/sessionN/face/` — face-view snapshots, stick frames, metrics.json, annotated MP4
+- `output/sessionN/back/` — back-view snapshots, stick frames, metrics.json, annotated MP4
+- `output/sessionN/session.json` — manifest used by `faults.py`
+
+The console output only shows pose extraction progress — no fault report.
+
+### Step 2 — Fault detection
 ```bash
-python3 main.py swing.mov --back
+python3 faults.py output/sessionN/
 ```
 
-### With stick figure video
-```bash
-python3 main.py swing.mov --stick
-python3 main.py swing.mov --back --stick
-```
+Runs the syndrome-based fault detector on both views and prints reports.
 
-### Skip the annotated video (faster, just metrics + faults)
-```bash
-python3 main.py swing.mov --no-video --no-feedback
-```
-
-### Specify club
-```bash
-python3 main.py swing.mov --club driver
-python3 main.py swing.mov --club 7i
-python3 main.py swing.mov --club pw
-```
-Valid clubs: `driver`, `3w`, `5w`, `7w`, `hybrid`, `2i` `3i` `4i` `5i` `6i` `7i` `8i` `9i`, `pw` `gw` `sw` `lw`
-
-### Left-handed golfer
-```bash
-python3 main.py swing.mov --hand left
-```
-
-### With AI coaching feedback (requires Anthropic API key)
+#### With AI coaching feedback
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python3 main.py swing.mov --club 7i
+python3 faults.py output/sessionN/
 
-# Or pass key directly
-python3 main.py swing.mov --club 7i --api-key sk-ant-...
+# Or pass the key directly:
+python3 faults.py output/sessionN/ --api-key sk-ant-...
 ```
 
-### Organize multiple swings into named sessions
+#### Override the captured club
 ```bash
-# Groups all outputs for one session together
-python3 main.py swing_face.mov --name "session1" --club 7i --stick
-python3 main.py swing_back.mov --name "session1" --back --stick
+python3 faults.py output/sessionN/ --club driver
 ```
+
+#### Save the fault reports to JSON
+```bash
+python3 faults.py output/sessionN/ --save-json
+# Writes faults_face.json + faults_back.json into the session folder.
+```
+
+#### Only one view
+```bash
+python3 faults.py output/sessionN/ --only face
+python3 faults.py output/sessionN/ --only back
+```
+
+### Other capture options
+
+Just one view:
+```bash
+python3 main.py --face swing.mov
+python3 main.py --back swing_back.mov
+```
+
+Skip the annotated video (faster — stick + metrics only):
+```bash
+python3 main.py --face swing.mov --back swing_back.mov --no-video
+```
+
+Skip stick figure rendering entirely:
+```bash
+python3 main.py --face swing.mov --back swing_back.mov --no-stick
+```
+
+Stick-only (no original side-by-side):
+```bash
+python3 main.py --face swing.mov --back swing_back.mov --stick-only
+```
+
+Custom session name (otherwise auto sessionN):
+```bash
+python3 main.py --face swing.mov --back swing_back.mov --name "driver_round1"
+```
+
+Left-handed golfer:
+```bash
+python3 main.py --face swing.mov --hand left
+```
+
+Valid clubs: `driver`, `3w`, `5w`, `7w`, `hybrid`, `2i` `3i` `4i` `5i` `6i` `7i` `8i` `9i`, `pw` `gw` `sw` `lw`
 
 ---
 
 ## Output Structure
 
-Without `--name`:
+Every run goes into a single session folder so face and back never get separated.
+
+After `main.py` (auto-named, default):
 ```
 output/
-├── face/
-│   ├── snapshots/          ← annotated PNG per frame
-│   ├── stick_frames/       ← stick figure PNG per frame
-│   ├── swing_analyzed.mp4  ← annotated video
-│   └── swing_stick.mp4     ← stick figure video (8fps slow motion)
-└── back/
-    ├── snapshots/
-    ├── stick_frames/
-    ├── swing_back.mp4
-    └── swing_back_stick.mp4
+└── session1/                  ← next free sessionN
+    ├── session.json            ← manifest read by faults.py
+    ├── face/
+    │   ├── snapshots/          ← annotated PNG per frame
+    │   ├── stick_frames/       ← stick figure PNG per frame
+    │   ├── metrics.json        ← per-frame metrics (input to faults.py)
+    │   ├── swing_analyzed.mp4  ← annotated video
+    │   └── swing_stick.mp4     ← stick figure video (8fps slow motion)
+    └── back/
+        ├── snapshots/
+        ├── stick_frames/
+        ├── metrics.json
+        ├── swing_back.mp4
+        └── swing_back_stick.mp4
 ```
 
-With `--name "session1"`:
+After `faults.py --save-json`:
+```
+output/session1/
+├── faults_face.json
+└── faults_back.json
+```
+
+With `--name "driver_round1"`:
 ```
 output/
-└── session1/
+└── driver_round1/
+    ├── session.json
     ├── face/
     └── back/
 ```
@@ -152,22 +210,35 @@ output/
 
 ## All Command Options
 
+### `main.py` — capture
 ```
-python3 main.py [video] [options]
+python3 main.py [--face FACE_VIDEO] [--back BACK_VIDEO] [options]
+
+Inputs (pass one or both):
+  --face, -f PATH     Face-on swing video
+  --back, -b PATH     Back / down-the-line swing video
 
 Options:
-  --back              Analyze as back view (default: face view)
-  --club CLUB         Club used: driver, 7i, pw, etc. (default: 7i)
+  --name NAME         Session folder name (default: auto sessionN)
+  --club CLUB         Club used (recorded into session.json) (default: 7i)
   --hand {right,left} Golfer's dominant hand (default: right)
-  --name NAME         Session name for organized output folders
-  --stick             Generate side-by-side stick figure video
-  --stick-only        Stick figure on black only (no original alongside)
-  --no-video          Skip annotated video output (faster)
-  --no-feedback       Skip AI coaching feedback
-  --api-key KEY       Anthropic API key for AI feedback
-  --max-faults N      Max faults to get AI feedback on (default: 3)
   --snapshots N       Limit to N evenly-spaced frames (default: every frame)
-  --output PATH       Custom output video path
+  --no-video          Skip annotated MP4 output (faster)
+  --stick-only        Stick figure on black only (no original alongside)
+  --no-stick          Skip stick figure rendering entirely
+```
+
+### `faults.py` — fault detection + AI feedback
+```
+python3 faults.py <session-folder> [options]
+
+Options:
+  --only {face,back,both}  Limit analysis to one view (default: both)
+  --club CLUB              Override club from session.json
+  --no-feedback            Skip LLM coaching feedback
+  --api-key KEY            Anthropic API key (else $ANTHROPIC_API_KEY)
+  --max-faults N           Max faults to send to LLM (default: 3)
+  --save-json              Write faults_face.json / faults_back.json
 ```
 
 ---

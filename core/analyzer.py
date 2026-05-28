@@ -318,9 +318,10 @@ class SwingAnalyzer:
             )
             result.annotated_video_path = output_path
 
-        # Store for external access (e.g. stick figure rendering)
+        # Store for external access (e.g. stick figure rendering, metrics dump)
         self._last_landmarks = all_landmarks
         self._last_snapshot_indices = snapshot_indices
+        self._last_metrics = all_metrics
 
         if show_progress:
             print("Done.\n")
