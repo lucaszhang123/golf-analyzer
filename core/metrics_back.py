@@ -194,11 +194,20 @@ def extract_back_metrics(
     m.head_forward_px = float(nose[0] - mid_hip[0])
 
     # --- Shoulder plane angle ---
+    # arctan2 returns -180 to +180. We normalize to -90 to +90
+    # because shoulder tilt is symmetric — a line pointing left at
+    # 163° is the same tilt as one pointing right at -17°.
+    # We also ensure the vector always points trail→lead so the
+    # sign is consistent: positive = trail shoulder higher than lead.
     shld_vec = ts - ls
     if np.linalg.norm(shld_vec) > 1:
-        m.shoulder_plane_deg = float(
-            np.degrees(np.arctan2(-shld_vec[1], shld_vec[0]))
-        )
+        raw_angle = float(np.degrees(np.arctan2(-shld_vec[1], shld_vec[0])))
+        # Normalize to (-90, 90] — fold angles outside this range
+        if raw_angle > 90:
+            raw_angle = raw_angle - 180
+        elif raw_angle < -90:
+            raw_angle = raw_angle + 180
+        m.shoulder_plane_deg = raw_angle
 
     # --- Wrist hinge ---
     hand_mid = midpoint(lw, tw)
