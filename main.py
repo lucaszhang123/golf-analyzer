@@ -305,7 +305,6 @@ def main():
         print("BACK VIEW — capture")
         print("=" * 60)
         capture_back(args, back_path, session_dir, stick_mode)
-
     write_session_manifest(session_dir, args, face_path, back_path)
 
     print("\n" + "=" * 60)

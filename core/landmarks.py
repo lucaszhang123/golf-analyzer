@@ -9,12 +9,23 @@ import numpy as np
 
 class LM(IntEnum):
     NOSE = 0
+    # Ears — head rotation axis; better reverse-pivot / loss-of-posture signal
+    # than nose alone (nose only gives lateral drift, ears give rotation).
+    LEFT_EAR  = 7
+    RIGHT_EAR = 8
     LEFT_SHOULDER = 11
     RIGHT_SHOULDER = 12
     LEFT_ELBOW = 13
     RIGHT_ELBOW = 14
     LEFT_WRIST = 15
     RIGHT_WRIST = 16
+    # Hand landmarks — palm plane (wrist bow/cup), shaft angle proxy at top
+    LEFT_PINKY  = 17
+    RIGHT_PINKY = 18
+    LEFT_INDEX  = 19
+    RIGHT_INDEX = 20
+    LEFT_THUMB  = 21
+    RIGHT_THUMB = 22
     LEFT_HIP = 23
     RIGHT_HIP = 24
     LEFT_KNEE = 25

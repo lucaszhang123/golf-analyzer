@@ -19,7 +19,7 @@ import urllib.error
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from .fault_detector import FaultReport
+from .fault_engine import FaultReport
 
 
 @dataclass

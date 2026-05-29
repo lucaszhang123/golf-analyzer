@@ -208,31 +208,35 @@ class SyndromeEngine:
 
     def _detect_phases(self) -> Dict[str, Tuple[int, int]]:
         """
-        Returns frame index ranges for each phase:
-          address:      (0, addr_end)
-          backswing:    (addr_end, top)
-          downswing:    (top, impact)
-          follow_through:(impact, n-1)
+        Returns frame index ranges for each phase.
+
+        ROBUST MULTI-SIGNAL APPROACH:
+        Top is detected by TWO independent signals and the better one chosen:
+          1. Hand height minimum (primary) — hands are physically highest at top
+          2. Shoulder rotation peak (fallback) — rotation peaks at top
+
+        The hand-height signal fails on truncated videos (hands never return
+        to address height so the detector drifts into follow-through).
+        The rotation signal fails for slow takeaways. Using both and cross-
+        validating makes detection robust to both failure modes.
+
+        Impact is estimated from the rotation curve drop rather than hand
+        height return — more reliable at low frame rates where the hands
+        move too fast to catch returning to address height.
         """
         n = self.n
-        conf = np.array([m.confidence for m in self.metrics])
+        conf     = np.array([m.confidence for m in self.metrics])
+        hand_y   = np.array([getattr(m, 'hand_height_y', 0) or 0.0 for m in self.metrics])
+        weight   = np.array([getattr(m, 'weight_shift',  0) or 0.0 for m in self.metrics])
+        shoulder = np.array([getattr(m, 'shoulder_rotation_deg', 0) or 0.0 for m in self.metrics])
+        weight_s = self._smooth(weight, 3)
+        shld_s   = self._smooth(shoulder, max(3, n // 15))
 
-        # Hand height: lower y value = higher hands
-        hand_y = np.array([
-            getattr(m, 'hand_height_y', 0) or 0.0
-            for m in self.metrics
-        ])
-
-        # Address: first stable window in first 30%
+        # Address: most stable weight-shift window in first 30%
         cutoff = max(3, n // 3)
         win    = max(2, n // 20)
         addr   = 0
         best_v = float("inf")
-
-        # Use weight shift stability for address
-        weight = np.array([getattr(m, 'weight_shift', 0) or 0.0 for m in self.metrics])
-        weight_s = self._smooth(weight, 3)
-
         for i in range(max(0, cutoff - win)):
             v = float(np.var(weight_s[i:i+win]))
             c = float(np.mean(conf[i:i+win]))
@@ -240,38 +244,80 @@ class SyndromeEngine:
                 best_v = v
                 addr   = i + win // 2
 
-        # Top: minimum hand y (highest hands) between addr and 85%
-        s_start = addr + 1
-        s_end   = min(n, addr + int((n - addr) * 0.85))
-        top     = addr + 1
-
+        # Top — Signal 1: hand height minimum
+        # Search up to 80% of remaining frames (not 85%) to avoid
+        # bleeding into follow-through on truncated videos.
+        s_start  = addr + 1
+        s_end    = min(n, addr + int((n - addr) * 0.80))
+        top_hand = addr + 1
         if np.any(hand_y[s_start:s_end] > 0):
-            region  = hand_y[s_start:s_end]
-            c_reg   = conf[s_start:s_end]
-            masked  = np.where(c_reg > 0.4, region, np.max(region) + 1)
-            top     = s_start + int(np.argmin(masked))
+            region   = hand_y[s_start:s_end]
+            c_reg    = conf[s_start:s_end]
+            masked   = np.where(c_reg > 0.4, region, np.max(region) + 1)
+            top_hand = s_start + int(np.argmin(masked))
 
-        # Impact: hands return to ~address height
-        impact = top + max(1, int((n - top) * 0.60))
+        # Top — Signal 2: shoulder rotation peak (weighted by confidence)
+        search_end = min(n - 1, addr + int((n - addr) * 0.80))
+        top_rot    = addr + 1
+        if search_end > addr + 1:
+            weighted = shld_s[addr+1:search_end] * conf[addr+1:search_end]
+            top_rot  = addr + 1 + int(np.argmax(weighted))
+
+        # Cross-validate: pick the more reliable estimate.
+        # Hand-height signal is better when the arc is large (hands moved a lot).
+        # Rotation signal is better when hand tracking is poor (low fps / occlusion).
+        hand_arc = 0.0
         if np.any(hand_y > 0):
-            addr_h  = float(np.mean(hand_y[:max(1, top//4)] + 1e-9))
-            top_h   = float(hand_y[top])
-            arc     = addr_h - top_h
-            if arc > 5:
-                thresh = top_h + arc * 0.75
-                for i in range(top + 1, n):
-                    if hand_y[i] >= thresh and conf[i] > 0.4:
-                        impact = i
-                        break
+            addr_h   = float(np.mean(hand_y[:max(1, addr + 1)]))
+            hand_arc = max(0.0, addr_h - float(hand_y[top_hand]))
+
+        if hand_arc > 100:
+            top = top_hand   # very clear hand signal
+        elif hand_arc > 50 and abs(top_hand - top_rot) < max(3, n // 5):
+            top = top_hand   # hand and rotation agree
+        else:
+            top = top_rot    # defer to rotation — more stable at low fps
+
+        # Impact — use rotation curve drop rather than hand return.
+        # At 28fps the hands move too fast; the rotation curve is smoother.
+        # Impact = first frame after top where smoothed rotation drops below
+        # 55% of its peak value.
+        impact        = top + max(1, int((n - top) * 0.50))
+        rot_at_top    = float(shld_s[top]) if top < n else 0.0
+
+        if rot_at_top > 5:
+            drop_thresh = rot_at_top * 0.55
+            found       = False
+            for i in range(top + 1, n):
+                if shld_s[i] < drop_thresh and conf[i] > 0.4:
+                    impact = i
+                    found  = True
+                    break
+
+            if not found:
+                # Fallback: hand height return (works on full follow-through videos)
+                addr_h = float(np.mean(hand_y[:max(1, addr + 1)] + 1e-9))
+                top_h  = float(hand_y[top]) if top < n else addr_h
+                arc    = addr_h - top_h
+                if arc > 30:
+                    thresh = top_h + arc * 0.70
+                    for i in range(top + 1, n):
+                        if hand_y[i] >= thresh and conf[i] > 0.4:
+                            impact = i
+                            break
+
+        # Sanity caps — prevent phases overrunning on truncated videos.
+        top    = min(top,    int(n * 0.75))
+        impact = min(max(impact, top + 1), int(n * 0.95))
 
         return {
-            "address":       (0,      max(0, addr)),
-            "backswing":     (addr,   top),
-            "downswing":     (top,    impact),
-            "follow_through":(impact, n - 1),
-            "addr_idx":      addr,
-            "top_idx":       top,
-            "impact_idx":    impact,
+            "address":        (0,      max(0, addr)),
+            "backswing":      (addr,   top),
+            "downswing":      (top,    impact),
+            "follow_through": (impact, n - 1),
+            "addr_idx":       addr,
+            "top_idx":        top,
+            "impact_idx":     impact,
         }
 
     # ------------------------------------------------------------------

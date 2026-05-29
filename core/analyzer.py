@@ -21,6 +21,7 @@ from .club_detector import ClubDetector, draw_club
 from .stick_figure import StickFigureRenderer
 from .annotator import VideoAnnotator
 from .landmarks import LM, get_point
+from .pose_filter import PoseFilter
 
 MODEL_PATH = Path.home() / ".golf_analyzer" / "pose_landmarker_full.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
@@ -265,6 +266,30 @@ class SwingAnalyzer:
 
         cap.release()
 
+        # --- Kinematic constraint filtering ---
+        # Clean landmark trajectories before anything downstream uses them.
+        # Bad frames from motion blur, occlusion, and joint swaps are
+        # interpolated over using cubic splines; uncorrectable runs are zeroed.
+        if show_progress:
+            print("  Running kinematic pose filter...")
+        pf = PoseFilter(image_w=image_w, image_h=image_h, fps=fps, verbose=show_progress)
+        all_landmarks, filter_quality = pf.filter_with_quality(all_landmarks)
+
+        # Re-extract metrics from the cleaned landmarks so every downstream
+        # step (rotation normalisation, fault detection, snapshots) uses
+        # corrected joint positions rather than the raw noisy ones.
+        all_metrics = []
+        for fi, lm in enumerate(all_landmarks):
+            if lm and lm.pose_landmarks:
+                m = extract_metrics(
+                    lm.pose_landmarks.landmark,
+                    image_w, image_h,
+                    handedness=self.handedness,
+                )
+            else:
+                m = SwingMetrics(confidence=0.0)
+            all_metrics.append(m)
+
         # --- Normalize rotation relative to address (first good frame) ---
         self._normalize_rotation(all_metrics, all_landmarks, image_w, image_h)
 
@@ -343,6 +368,7 @@ class SwingAnalyzer:
         """
         cutoff = max(1, int(len(all_metrics) * 0.4))
         base_nose = base_hip_x = None
+        addr_ear_mid_x = None
 
         # Find address frame: first stable high-confidence frame in first 40%
         addr_shoulder_w = addr_hip_w = None
@@ -354,6 +380,9 @@ class SwingAnalyzer:
                 addr_hip_w = m._hip_width_px
                 addr_shoulder_z = m._shoulder_z_diff
                 addr_hip_z = m._hip_z_diff
+                # Store ear midpoint x for lateral drift normalization
+                if m._ear_mid_x_raw is not None:
+                    addr_ear_mid_x = m._ear_mid_x_raw
                 if lm and lm.pose_landmarks:
                     lms = lm.pose_landmarks.landmark
                     base_nose = get_point(lms, LM.NOSE, w, h)
@@ -405,7 +434,7 @@ class SwingAnalyzer:
             # --- X-factor ---
             m.x_factor_deg = round(max(0.0, m.shoulder_rotation_deg - m.hip_rotation_deg), 1)
 
-            # --- Head movement and hip sway ---
+            # --- Head movement (nose) and hip sway ---
             if lm and lm.pose_landmarks and base_nose is not None:
                 lms = lm.pose_landmarks.landmark
                 nose = get_point(lms, LM.NOSE, w, h)
@@ -414,6 +443,13 @@ class SwingAnalyzer:
                 cur_hip_x = float((lhip[0] + rhip[0]) / 2)
                 m.head_movement_px = float(np.linalg.norm(nose - base_nose))
                 m.hip_sway_px = float(cur_hip_x - base_hip_x)
+
+            # --- Ear-based head lateral drift ---
+            # head_rotation_deg is already set per-frame in extract_metrics.
+            # Here we compute head_lateral_px = how far the ear midpoint has
+            # drifted laterally from the address position.
+            if m._ear_mid_x_raw is not None and addr_ear_mid_x is not None:
+                m.head_lateral_px = float(m._ear_mid_x_raw - addr_ear_mid_x)
 
     def _write_annotated_video(self, output_path, frames, all_landmarks,
                                 all_metrics, snapshot_indices, w, h, fps):

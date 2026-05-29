@@ -1,0 +1,744 @@
+"""
+fault_engine.py — Simple, direct swing fault detection.
+
+Six faults, each backed by large reliable body landmarks.
+No syndrome complexity, no multi-signal voting — each fault is a
+straightforward geometric check against the address baseline.
+
+FAULTS IMPLEMENTED:
+  1. SPINE_ANGLE_CHANGE  — spine tilts/straightens from address through swing
+                           (face-on: lateral tilt; DTL: forward bend)
+  2. REVERSE_SPINE       — spine tilts TOWARD target in backswing (face-on)
+  3. HIP_SWAY_SLIDE      — hips drift excessively laterally (face-on)
+  4. EARLY_EXTENSION     — hips thrust toward ball in downswing (DTL)
+  5. HEAD_MOVEMENT       — head drifts laterally or rotates incorrectly
+  6. FLAT_SHOULDER_PLANE — shoulders turn too horizontally at top (DTL)
+
+DESIGN:
+  - Every fault is measured relative to the golfer's OWN address position.
+    No assumed pixel sizes or resolution-dependent constants.
+  - Thresholds are expressed as multiples of body-proportion measurements
+    (e.g. hip width, body height) so they scale automatically.
+  - Each fault returns a severity 0.0-1.0 and a plain description.
+  - Phase indices (address, top, impact) are passed in from the caller.
+
+USAGE:
+    from core.fault_engine import FaultEngine, FaultResult
+
+    engine = FaultEngine(
+        face_metrics=face_metrics,   # List[SwingMetrics] or None
+        back_metrics=back_metrics,   # List[BackMetrics]  or None
+    )
+    results = engine.detect()        # List[FaultResult]
+    print(engine.summary())
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FaultResult:
+    name: str
+    display_name: str
+    detected: bool
+    severity: float          # 0.0 – 1.0
+    severity_label: str      # "mild" | "moderate" | "severe"
+    phase: str               # when in the swing this occurs
+    measured: Optional[float]
+    threshold: Optional[float]
+    description: str
+    cause: str
+    ball_flight: str
+    view: str                # "face" | "back" | "both"
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+
+def _label(s: float) -> str:
+    if s < 0.40: return "mild"
+    if s < 0.70: return "moderate"
+    return "severe"
+
+
+# ---------------------------------------------------------------------------
+# Phase detection — same logic as syndrome_engine but self-contained
+# ---------------------------------------------------------------------------
+
+def _smooth(arr: np.ndarray, w: int = 3) -> np.ndarray:
+    if w < 2 or len(arr) < w:
+        return arr.copy()
+    return np.convolve(arr, np.ones(w) / w, mode="same")
+
+
+def _detect_phases(metrics: list) -> Dict[str, int]:
+    """
+    Returns dict with addr_idx, top_idx, impact_idx.
+    Works with both SwingMetrics and BackMetrics.
+    """
+    n = len(metrics)
+    if n == 0:
+        return {"addr_idx": 0, "top_idx": 0, "impact_idx": 0}
+
+    conf     = np.array([m.confidence for m in metrics])
+    hand_y   = np.array([getattr(m, "hand_height_y", 0) or 0.0 for m in metrics])
+    weight   = np.array([getattr(m, "weight_shift",  0) or 0.0 for m in metrics])
+    shoulder = np.array([getattr(m, "shoulder_rotation_deg", 0) or 0.0 for m in metrics])
+    weight_s = _smooth(weight, 3)
+    shld_s   = _smooth(shoulder, max(3, n // 15))
+
+    # Address
+    cutoff = max(3, n // 3)
+    win    = max(2, n // 20)
+    addr   = 0
+    best_v = float("inf")
+    for i in range(max(0, cutoff - win)):
+        v = float(np.var(weight_s[i:i+win]))
+        c = float(np.mean(conf[i:i+win]))
+        if v < best_v and c > 0.5:
+            best_v = v
+            addr   = i + win // 2
+
+    # Top — hand height minimum, validated against rotation peak
+    s_start = addr + 1
+    s_end   = min(n, addr + int((n - addr) * 0.80))
+    top_hand = addr + 1
+    if np.any(hand_y[s_start:s_end] > 0):
+        region = hand_y[s_start:s_end]
+        c_reg  = conf[s_start:s_end]
+        masked = np.where(c_reg > 0.4, region, np.max(region) + 1)
+        top_hand = s_start + int(np.argmin(masked))
+
+    top_rot = addr + 1
+    if s_end > addr + 1:
+        weighted = shld_s[addr+1:s_end] * conf[addr+1:s_end]
+        top_rot  = addr + 1 + int(np.argmax(weighted))
+
+    addr_h   = float(np.mean(hand_y[:max(1, addr+1)]))
+    hand_arc = max(0.0, addr_h - float(hand_y[top_hand])) if np.any(hand_y > 0) else 0
+
+    if hand_arc > 100:
+        top = top_hand
+    elif hand_arc > 50 and abs(top_hand - top_rot) < max(3, n // 5):
+        top = top_hand
+    else:
+        top = top_rot
+    top = min(top, int(n * 0.75))
+
+    # Impact — rotation drop
+    impact = top + max(1, int((n - top) * 0.50))
+    rot_at_top = float(shld_s[top]) if top < n else 0.0
+    if rot_at_top > 5:
+        thresh = rot_at_top * 0.55
+        for i in range(top + 1, n):
+            if shld_s[i] < thresh and conf[i] > 0.4:
+                impact = i
+                break
+    impact = min(max(impact, top + 1), int(n * 0.95))
+
+    return {"addr_idx": addr, "top_idx": top, "impact_idx": impact}
+
+
+# ---------------------------------------------------------------------------
+# Helper: get smoothed attribute array with confidence mask
+# ---------------------------------------------------------------------------
+
+def _get(metrics, attr, default=0.0):
+    return np.array([getattr(m, attr, None) or default for m in metrics])
+
+
+def _phase_mean(arr, conf, start, end, min_conf=0.55):
+    """Mean of arr[start:end] for frames above min_conf."""
+    if end <= start:
+        return None
+    window = arr[start:end]
+    c_win  = conf[start:end]
+    mask   = c_win >= min_conf
+    if mask.sum() < 2:
+        return None
+    return float(np.mean(window[mask]))
+
+
+def _phase_max(arr, conf, start, end, min_conf=0.55):
+    if end <= start:
+        return None
+    mask = conf[start:end] >= min_conf
+    if mask.sum() < 2:
+        return None
+    return float(np.max(arr[start:end][mask]))
+
+
+def _at(arr, idx):
+    """Value at index, or None if out of range."""
+    if 0 <= idx < len(arr):
+        v = arr[idx]
+        return float(v) if v is not None else None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main engine
+# ---------------------------------------------------------------------------
+
+class FaultEngine:
+    """
+    Detects six swing faults from face-on and/or DTL metrics.
+
+    Parameters
+    ----------
+    face_metrics : List[SwingMetrics] or None
+    back_metrics : List[BackMetrics]  or None
+    """
+
+    # Detection threshold: minimum severity to report a fault
+    MIN_SEVERITY = 0.25
+
+    def __init__(
+        self,
+        face_metrics: Optional[list] = None,
+        back_metrics: Optional[list] = None,
+    ):
+        self.face = face_metrics or []
+        self.back = back_metrics or []
+
+        self.fp = _detect_phases(self.face) if self.face else {"addr_idx": 0, "top_idx": 0, "impact_idx": 0}
+        self.bp = _detect_phases(self.back) if self.back else {"addr_idx": 0, "top_idx": 0, "impact_idx": 0}
+
+        # Pre-compute confidence arrays
+        self.fc = _get(self.face, "confidence") if self.face else np.array([])
+        self.bc = _get(self.back, "confidence") if self.back else np.array([])
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def detect(self) -> List[FaultResult]:
+        results = []
+        checks = [
+            self._spine_angle_change,
+            self._reverse_spine,
+            self._hip_sway_slide,
+            self._early_extension,
+            self._head_movement,
+            self._flat_shoulder_plane,
+        ]
+        for check in checks:
+            try:
+                r = check()
+                if r is not None and r.severity >= self.MIN_SEVERITY:
+                    results.append(r)
+            except Exception as e:
+                pass  # never crash on a single fault check
+
+        results.sort(key=lambda r: -r.severity)
+        return results
+
+    def summary(self) -> str:
+        results = self.detect()
+        phases_f = self.fp
+        phases_b = self.bp
+
+        lines = [
+            "",
+            "Swing Fault Report",
+            "=" * 50,
+            f"Face phases : address={phases_f['addr_idx']}  "
+            f"top={phases_f['top_idx']}  impact={phases_f['impact_idx']}",
+            f"Back phases : address={phases_b['addr_idx']}  "
+            f"top={phases_b['top_idx']}  impact={phases_b['impact_idx']}",
+            "",
+        ]
+
+        if not results:
+            lines.append("No significant faults detected.")
+            return "\n".join(lines)
+
+        lines.append(f"Faults detected: {len(results)}\n")
+        for i, r in enumerate(results, 1):
+            val = f"{r.measured:.1f}" if r.measured is not None else "N/A"
+            thr = f"{r.threshold:.1f}" if r.threshold is not None else "N/A"
+            lines += [
+                f"{i}. [{r.severity_label.upper()}] {r.display_name}",
+                f"   Phase      : {r.phase}",
+                f"   Measured   : {val}  Threshold: {thr}",
+                f"   View       : {r.view}",
+                f"   Detail     : {r.description}",
+                f"   Cause      : {r.cause}",
+                f"   Ball flight: {r.ball_flight}",
+                "",
+            ]
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {
+            "faults": [r.to_dict() for r in self.detect()],
+            "phases_face": self.fp,
+            "phases_back": self.bp,
+        }
+
+    # ------------------------------------------------------------------
+    # Fault 1: Spine angle change
+    # Face-on: lateral tilt (spine_tilt_deg) should stay stable.
+    # DTL: forward bend (spine_angle_deg) should stay stable.
+    # We measure the max deviation from address across the whole swing.
+    # ------------------------------------------------------------------
+    def _spine_angle_change(self) -> Optional[FaultResult]:
+        results = []
+
+        # --- Face-on: lateral tilt stability ---
+        if len(self.face) >= 10:
+            addr = self.fp["addr_idx"]
+            tilt = _smooth(_get(self.face, "spine_tilt_deg"), 3)
+            conf = self.fc
+            addr_val = _at(tilt, addr)
+            if addr_val is not None and conf[addr] > 0.55:
+                # Max change over the whole swing
+                good = conf >= 0.55
+                if good.sum() >= 5:
+                    changes = np.abs(tilt[good] - addr_val)
+                    max_change = float(np.percentile(changes, 90))  # 90th percentile, not max — robust to spikes
+                    threshold  = 10.0  # degrees
+                    if max_change > threshold:
+                        sev = min(1.0, (max_change - threshold) / 20.0)
+                        results.append(("face", max_change, threshold, sev,
+                                       "Lateral spine tilt changed significantly from address"))
+
+        # --- DTL: forward bend stability ---
+        if len(self.back) >= 10:
+            addr = self.bp["addr_idx"]
+            top  = self.bp["top_idx"]
+            imp  = self.bp["impact_idx"]
+            spine = _smooth(_get(self.back, "spine_angle_deg"), 3)
+            conf  = self.bc
+            addr_val = _at(spine, addr)
+            if addr_val is not None and conf[addr] > 0.55:
+                # Check change at top and impact specifically
+                top_val = _phase_mean(spine, conf, max(0, top-2), min(len(spine), top+3))
+                imp_val = _phase_mean(spine, conf, max(0, imp-2), min(len(spine), imp+3))
+                changes = [abs(v - addr_val) for v in [top_val, imp_val] if v is not None]
+                if changes:
+                    max_change = max(changes)
+                    threshold  = 8.0
+                    if max_change > threshold:
+                        sev = min(1.0, (max_change - threshold) / 15.0)
+                        results.append(("back", max_change, threshold, sev,
+                                       "Forward spine bend changed significantly from address"))
+
+        if not results:
+            return None
+
+        # Take the highest severity finding
+        results.sort(key=lambda x: -x[3])
+        view, measured, threshold, sev, detail = results[0]
+
+        return FaultResult(
+            name="spine_angle_change",
+            display_name="Loss of Spine Angle",
+            detected=True,
+            severity=round(sev, 3),
+            severity_label=_label(sev),
+            phase="backswing / downswing",
+            measured=round(measured, 1),
+            threshold=threshold,
+            description=f"Spine angle changed {measured:.1f}° from address (threshold: {threshold:.0f}°). "
+                        "Elite golfers maintain their setup spine angle throughout the swing.",
+            cause="Limited hip mobility forces the spine to compensate. "
+                  "Often paired with early extension or reverse pivot.",
+            ball_flight="Inconsistent contact, fat/thin shots, directional issues",
+            view=view,
+        )
+
+    # ------------------------------------------------------------------
+    # Fault 2: Reverse spine angle (face-on)
+    # Spine tilts TOWARD the target in the backswing.
+    # Measured as: spine_tilt_deg increases (positive = toward target)
+    # from address to top of backswing.
+    # ------------------------------------------------------------------
+    def _reverse_spine(self) -> Optional[FaultResult]:
+        if len(self.face) < 10:
+            return None
+
+        addr = self.fp["addr_idx"]
+        top  = self.fp["top_idx"]
+        tilt = _smooth(_get(self.face, "spine_tilt_deg"), 3)
+        conf = self.fc
+
+        addr_val = _at(tilt, addr)
+        if addr_val is None or conf[addr] < 0.55:
+            return None
+
+        # Average tilt in the last third of backswing (near top)
+        bs_start = max(addr + 1, top - max(2, (top - addr) // 3))
+        top_val  = _phase_mean(tilt, conf, bs_start, top + 1)
+        if top_val is None:
+            return None
+
+        # Positive = tilting toward target = reverse spine
+        change = top_val - addr_val
+        threshold = 6.0  # degrees toward target
+
+        if change <= threshold:
+            return None
+
+        sev = min(1.0, (change - threshold) / 15.0)
+        return FaultResult(
+            name="reverse_spine",
+            display_name="Reverse Spine Angle",
+            detected=True,
+            severity=round(sev, 3),
+            severity_label=_label(sev),
+            phase="backswing",
+            measured=round(change, 1),
+            threshold=threshold,
+            description=f"Spine tilted {change:.1f}° toward the target during backswing "
+                        f"(threshold: {threshold:.0f}°). Should maintain or tilt slightly away.",
+            cause="Trying to keep head perfectly still while restricting shoulder turn. "
+                  "Limited thoracic mobility. TPI identifies this as the #1 cause of back pain in golf.",
+            ball_flight="Over-the-top pull, steep downswing, slices",
+            view="face",
+        )
+
+    # ------------------------------------------------------------------
+    # Fault 3: Hip sway / slide (face-on)
+    # Sway: hips drift trail-ward in backswing (positive hip_sway_px = trail)
+    # Slide: hips drift target-ward in downswing without rotating
+    #
+    # Threshold is a fraction of hip_width at address (body-proportional).
+    # ------------------------------------------------------------------
+    def _hip_sway_slide(self) -> Optional[FaultResult]:
+        if len(self.face) < 10:
+            return None
+
+        addr = self.fp["addr_idx"]
+        top  = self.fp["top_idx"]
+        imp  = self.fp["impact_idx"]
+        sway = _get(self.face, "hip_sway_px")
+        conf = self.fc
+
+        # Body-proportional threshold: use shoulder width at address as reference
+        # Hip width isn't directly available but shoulder width proxy works
+        # ~20% of shoulder pixel width = reasonable sway limit
+        # We use a fixed pixel fallback if shoulder width unknown
+        raw_metrics = self.face
+        addr_shld_w = None
+        if addr < len(raw_metrics):
+            m = raw_metrics[addr]
+            w = getattr(m, "_shoulder_width_px", None)
+            if w and w > 20:
+                addr_shld_w = w
+
+        sway_threshold = addr_shld_w * 0.30 if addr_shld_w else 35.0
+
+        results = []
+
+        # --- Sway: backswing trail drift ---
+        bs_sway = _phase_mean(sway, conf, addr, top)
+        if bs_sway is not None and bs_sway > sway_threshold:
+            sev = min(1.0, (bs_sway - sway_threshold) / (sway_threshold * 1.5))
+            results.append(("sway", bs_sway, sev, "backswing",
+                           "Hips slide away from target in backswing instead of rotating"))
+
+        # --- Slide: downswing excessive target-ward drift ---
+        ds_sway = _get(self.face, "hip_sway_px")
+        ds_max_lead = _phase_max(-ds_sway, conf, top, imp)  # negative = lead direction
+        slide_threshold = sway_threshold * 2.0  # slide can be a bit more than sway
+
+        if ds_max_lead is not None and ds_max_lead > slide_threshold:
+            sev = min(1.0, (ds_max_lead - slide_threshold) / (slide_threshold * 1.5))
+            results.append(("slide", ds_max_lead, sev, "downswing",
+                           "Hips slide excessively toward target instead of rotating"))
+
+        if not results:
+            return None
+
+        results.sort(key=lambda x: -x[2])
+        fault_type, measured, sev, phase, detail = results[0]
+
+        display = "Hip Sway" if fault_type == "sway" else "Hip Slide"
+        return FaultResult(
+            name=f"hip_{fault_type}",
+            display_name=display,
+            detected=True,
+            severity=round(sev, 3),
+            severity_label=_label(sev),
+            phase=phase,
+            measured=round(measured, 1),
+            threshold=round(sway_threshold if fault_type == "sway" else slide_threshold, 1),
+            description=f"{detail}. Measured: {measured:.0f}px of lateral drift.",
+            cause="Limited hip rotation mobility. The body slides laterally instead of rotating "
+                  "because the hips can't turn freely.",
+            ball_flight="Fat shots, blocks, loss of power, inconsistent low point" if fault_type == "sway"
+                        else "Pushes, blocks right, loss of distance",
+            view="face",
+        )
+
+    # ------------------------------------------------------------------
+    # Fault 4: Early extension — DTL (hips thrust toward ball)
+    # Two signals:
+    #   a) hip_slide_px increases toward ball (forward) in downswing
+    #   b) spine_angle_deg decreases (less forward bend) from top to impact
+    # ------------------------------------------------------------------
+    def _early_extension(self) -> Optional[FaultResult]:
+        if len(self.back) < 10:
+            return None
+
+        top = self.bp["top_idx"]
+        imp = self.bp["impact_idx"]
+        conf = self.bc
+
+        spine = _smooth(_get(self.back, "spine_angle_deg"), 3)
+        top_spine = _phase_mean(spine, conf, max(0, top-2), min(len(spine), top+3))
+        imp_spine = _phase_mean(spine, conf, max(0, imp-2), min(len(spine), imp+3))
+
+        if top_spine is None or imp_spine is None:
+            return None
+
+        # Spine decreasing = standing up = early extension
+        spine_loss = top_spine - imp_spine  # positive = standing up
+        threshold  = 8.0  # degrees
+
+        if spine_loss <= threshold:
+            return None
+
+        sev = min(1.0, (spine_loss - threshold) / 15.0)
+        return FaultResult(
+            name="early_extension",
+            display_name="Early Extension",
+            detected=True,
+            severity=round(sev, 3),
+            severity_label=_label(sev),
+            phase="downswing",
+            measured=round(spine_loss, 1),
+            threshold=threshold,
+            description=f"Spine straightened {spine_loss:.1f}° from top of backswing to impact "
+                        f"(threshold: {threshold:.0f}°). Hips are thrusting toward the ball.",
+            cause="Limited hip mobility prevents rotation, so the body thrusts forward instead. "
+                  "TPI identifies early extension as the most common amateur fault.",
+            ball_flight="Thin shots, blocks, hooks from compensatory flip at impact",
+            view="back",
+        )
+
+    # ------------------------------------------------------------------
+    # Fault 5: Head movement (face-on + DTL)
+    # Face-on: lateral drift of nose from address
+    # DTL: forward drift and ear rotation
+    # Threshold: body-proportional (fraction of body height)
+    # ------------------------------------------------------------------
+    def _head_movement(self) -> Optional[FaultResult]:
+        results = []
+
+        # --- Face-on: lateral head drift ---
+        if len(self.face) >= 10:
+            conf = self.fc
+            head = _smooth(_get(self.face, "head_movement_px"), 3)
+            addr = self.fp["addr_idx"]
+
+            # Body height proxy: use hand height range
+            hy = _get(self.face, "hand_height_y")
+            body_h = float(np.max(hy) - np.min(hy)) if np.any(hy > 0) else 400.0
+            threshold = max(30.0, body_h * 0.08)  # 8% of body height
+
+            good = conf >= 0.55
+            if good.sum() >= 5:
+                max_head = float(np.percentile(head[good], 90))
+                if max_head > threshold:
+                    sev = min(1.0, (max_head - threshold) / (threshold * 2))
+                    results.append(("face", max_head, threshold, sev,
+                                   "Head moves excessively from its address position"))
+
+        # --- DTL: ear-based head rotation ---
+        if len(self.back) >= 10:
+            conf = self.bc
+            addr = self.bp["addr_idx"]
+            top  = self.bp["top_idx"]
+            head_fwd = _smooth(_get(self.back, "head_forward_px"), 3)
+
+            addr_hf = _at(head_fwd, addr)
+            top_hf  = _phase_mean(head_fwd, conf, max(0, top-2), min(len(head_fwd), top+3))
+
+            if addr_hf is not None and top_hf is not None:
+                fwd_change = top_hf - addr_hf  # positive = head moved forward (toward ball)
+                threshold  = 25.0  # pixels
+
+                if abs(fwd_change) > threshold:
+                    sev = min(1.0, (abs(fwd_change) - threshold) / 40.0)
+                    direction = "forward (toward ball)" if fwd_change > 0 else "backward (away from ball)"
+                    results.append(("back", abs(fwd_change), threshold, sev,
+                                   f"Head drifted {direction} during backswing"))
+
+        if not results:
+            return None
+
+        results.sort(key=lambda x: -x[3])
+        view, measured, threshold, sev, detail = results[0]
+
+        return FaultResult(
+            name="head_movement",
+            display_name="Excessive Head Movement",
+            detected=True,
+            severity=round(sev, 3),
+            severity_label=_label(sev),
+            phase="backswing",
+            measured=round(measured, 1),
+            threshold=round(threshold, 1),
+            description=f"{detail}. Measured: {measured:.0f}px of head drift.",
+            cause="Swaying body drags the head laterally. Or actively trying to 'keep your head down' "
+                  "causes excessive head restriction and then a lurch to compensate.",
+            ball_flight="Inconsistent contact, fat/thin, directional inconsistency",
+            view=view,
+        )
+
+    # ------------------------------------------------------------------
+    # Fault 6: Flat shoulder plane at top (DTL)
+    # The shoulder line at the top of the backswing should be tilted
+    # at roughly the same angle as the spine at address (perpendicular to spine).
+    # Too flat = shoulders turning horizontally = flat swing.
+    # Too steep = shoulders turning vertically = steep swing.
+    # ------------------------------------------------------------------
+    def _flat_shoulder_plane(self) -> Optional[FaultResult]:
+        if len(self.back) < 10:
+            return None
+
+        addr = self.bp["addr_idx"]
+        top  = self.bp["top_idx"]
+        conf = self.bc
+
+        shld_plane = _smooth(_get(self.back, "shoulder_plane_deg"), 3)
+        spine_angle = _get(self.back, "spine_angle_deg")
+
+        # Address spine angle = ideal shoulder plane reference
+        # Shoulders should turn perpendicular to spine axis
+        # If spine is 35° forward, shoulder plane should be ~35° from horizontal
+        addr_spine = _at(spine_angle, addr)
+        if addr_spine is None or conf[addr] < 0.55:
+            return None
+
+        ideal_plane = 90.0 - addr_spine  # degrees from horizontal
+
+        # Shoulder plane at top
+        top_plane = _phase_mean(shld_plane, conf,
+                                max(0, top-2), min(len(shld_plane), top+3))
+        if top_plane is None:
+            return None
+
+        # Deficit: how much flatter than ideal (positive = too flat)
+        deficit = ideal_plane - abs(top_plane)
+        flat_threshold = 12.0   # degrees flatter than ideal
+        steep_threshold = 12.0  # degrees steeper than ideal
+
+        if abs(deficit) < min(flat_threshold, steep_threshold):
+            return None
+
+        if deficit > flat_threshold:
+            sev = min(1.0, (deficit - flat_threshold) / 20.0)
+            label = "flat"
+            detail = (f"Shoulder plane is {deficit:.1f}° flatter than the ideal "
+                      f"{ideal_plane:.0f}° (perpendicular to spine)")
+            cause = "Standing too upright at address, or trail arm dominant — pushes the club flat."
+            ball_flight = "Hooks, pushes, fat contact from inside-out path"
+        else:
+            excess = -deficit
+            sev = min(1.0, (excess - steep_threshold) / 20.0)
+            label = "steep"
+            detail = (f"Shoulder plane is {excess:.1f}° steeper than the ideal "
+                      f"{ideal_plane:.0f}° (perpendicular to spine)")
+            cause = "Arms lifting rather than turning. Often paired with reverse spine angle."
+            ball_flight = "Slices, pulls, over-the-top path, steep angle of attack"
+
+        if sev < self.MIN_SEVERITY:
+            return None
+
+        return FaultResult(
+            name=f"shoulder_plane_{label}",
+            display_name=f"{'Flat' if label == 'flat' else 'Steep'} Shoulder Plane",
+            detected=True,
+            severity=round(sev, 3),
+            severity_label=_label(sev),
+            phase="backswing",
+            measured=round(top_plane, 1),
+            threshold=round(ideal_plane, 1),
+            description=detail,
+            cause=cause,
+            ball_flight=ball_flight,
+            view="back",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrapper — mirrors FaultReport interface for feedback.py
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FaultReport:
+    faults: List[FaultResult] = field(default_factory=list)
+    address_frame: int = 0
+    top_frame: int = 0
+    impact_frame: int = 0
+
+    # FeedbackGenerator reads .faults[i].display_name / severity_label /
+    # severity / phase / measured_value / elite_benchmark / description /
+    # root_cause / ball_flight — map our fields to those names
+    def summary(self) -> str:
+        engine = FaultEngine.__new__(FaultEngine)
+        engine.fp = {"addr_idx": self.address_frame, "top_idx": self.top_frame,
+                     "impact_idx": self.impact_frame}
+        engine.bp = engine.fp
+        engine._results = self.faults
+        lines = [
+            "", "Swing Fault Report", "=" * 50,
+            f"Phases: address={self.address_frame}  top={self.top_frame}  impact={self.impact_frame}",
+            ""
+        ]
+        if not self.faults:
+            lines.append("No significant faults detected.")
+            return "\n".join(lines)
+        lines.append(f"Faults: {len(self.faults)}\n")
+        for i, r in enumerate(self.faults, 1):
+            lines += [
+                f"{i}. [{r.severity_label.upper()}] {r.display_name}  (severity {r.severity:.2f})",
+                f"   Measured: {r.measured}  View: {r.view}",
+                f"   {r.description}",
+                f"   Cause: {r.cause}",
+                f"   Ball flight: {r.ball_flight}",
+                "",
+            ]
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {
+            "faults": [r.to_dict() for r in self.faults],
+            "fault_count": len(self.faults),
+            "top_fault": self.faults[0].to_dict() if self.faults else None,
+        }
+
+
+def run_fault_detection(
+    face_metrics: Optional[list] = None,
+    back_metrics: Optional[list] = None,
+    verbose: bool = True,
+) -> FaultReport:
+    """
+    Top-level entry point. Replace FaultDetector().detect() with this.
+    """
+    engine = FaultEngine(face_metrics=face_metrics, back_metrics=back_metrics)
+    faults = engine.detect()
+
+    phases = engine.fp if engine.face else engine.bp
+
+    if verbose:
+        print(engine.summary())
+
+    return FaultReport(
+        faults=faults,
+        address_frame=phases.get("addr_idx", 0),
+        top_frame=phases.get("top_idx", 0),
+        impact_frame=phases.get("impact_idx", 0),
+    )

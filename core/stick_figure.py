@@ -73,9 +73,12 @@ def draw_stick_figure(
 
     def pt(idx: LM) -> Optional[Tuple[int, int]]:
         lm = lms[int(idx)]
-        if lm.visibility < 0.35:
+        if lm.visibility < 0.10:   # low — prefer drawing to leaving a gap
             return None
-        return (int(lm.x * image_w), int(lm.y * image_h))
+        # Clamp to canvas — MediaPipe coords can exceed 1.0 at frame edges
+        x = int(min(max(lm.x * image_w, 0), image_w - 1))
+        y = int(min(max(lm.y * image_h, 0), image_h - 1))
+        return (x, y)
 
     # Connections
     for (a, b) in POSE_CONNECTIONS:
@@ -198,7 +201,7 @@ class StickFigureRenderer:
                 if lm and lm.pose_landmarks:
                     lms = lm.pose_landmarks.landmark
                     for (a, b) in POSE_CONNECTIONS:
-                        if lms[int(a)].visibility > 0.4 and lms[int(b)].visibility > 0.4:
+                        if lms[int(a)].visibility > 0.10 and lms[int(b)].visibility > 0.10:
                             pa = get_point(lms, a, orig_w, orig_h)
                             pb = get_point(lms, b, orig_w, orig_h)
                             color = SEGMENT_COLORS.get(

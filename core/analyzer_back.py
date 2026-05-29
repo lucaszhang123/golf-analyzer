@@ -26,6 +26,7 @@ from .stick_figure import (
     POSE_CONNECTIONS, SEGMENT_COLORS
 )
 from .landmarks import LM, get_point
+from .pose_filter import PoseFilter
 
 MODEL_PATH = Path.home() / ".golf_analyzer" / "pose_landmarker_full.task"
 MODEL_URL   = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task"
@@ -242,9 +243,50 @@ class BackAnalyzer:
                 print(f"  {100*frame_idx//total}% ({frame_idx}/{total})")
 
         cap.release()
+
+        # --- Kinematic constraint filtering ---
+        # Clean landmark trajectories before address baseline and delta metrics
+        # are computed, so all downstream numbers come from corrected positions.
+        if show_progress:
+            print("  Running kinematic pose filter (back view)...")
+        pf = PoseFilter(image_w=image_w, image_h=image_h, fps=fps, verbose=show_progress)
+        all_landmarks, filter_quality = pf.filter_with_quality(all_landmarks)
+
+        # Re-extract all metrics from cleaned landmarks, then recompute deltas.
+        addr_spine = addr_hip_x = addr_head_x = addr_head_y = None
+        all_metrics = []
+        for fi, lm in enumerate(all_landmarks):
+            if lm and lm.pose_landmarks:
+                m = extract_back_metrics(
+                    lm.pose_landmarks.landmark,
+                    image_w, image_h, self.handedness
+                )
+            else:
+                m = BackMetrics(confidence=0.0)
+
+            # Establish address baseline from first high-confidence frame
+            if (addr_spine is None and m.confidence > 0.65
+                    and m._spine_angle_raw is not None
+                    and fi < total // 3):
+                addr_spine  = m._spine_angle_raw
+                addr_hip_x  = m._hip_x_raw
+                addr_head_x = m._head_x_raw
+                addr_head_y = m._head_y_raw
+
+            # Compute delta metrics relative to address
+            if addr_spine is not None and m._spine_angle_raw is not None:
+                m.spine_angle_change = m._spine_angle_raw - addr_spine
+            if addr_hip_x is not None and m._hip_x_raw is not None:
+                m.hip_slide_px = float(m._hip_x_raw - addr_hip_x)
+            if addr_head_x is not None and m._head_x_raw is not None:
+                dx = m._head_x_raw - addr_head_x
+                dy = (m._head_y_raw or 0) - (addr_head_y or 0)
+                m.head_movement_px = float(np.sqrt(dx**2 + dy**2))
+
+            all_metrics.append(m)
+
         self._last_landmarks = all_landmarks
-        # Stash metrics so callers can serialize them without re-running pose.
-        self._last_metrics = all_metrics
+        self._last_metrics   = all_metrics
 
         # --- Fault detection (optional) ---
         if run_faults:

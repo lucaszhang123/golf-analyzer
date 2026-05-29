@@ -63,14 +63,14 @@ class VideoAnnotator:
             p = get_point(lms.landmark, lm_idx, w, h)
             pts[lm_idx] = (int(p[0]), int(p[1]))
             vis = lms.landmark[int(lm_idx)].visibility
-            if vis > 0.5:
+            if vis > 0.15:   # low threshold — draw even uncertain joints
                 cv2.circle(out, pts[lm_idx], 4, COLOR_JOINT, -1, cv2.LINE_AA)
 
         for a, b in POSE_CONNECTIONS:
             if a in pts and b in pts:
                 va = lms.landmark[int(a)].visibility
                 vb = lms.landmark[int(b)].visibility
-                if va > 0.4 and vb > 0.4:
+                if va > 0.10 and vb > 0.10:   # low — prefer a line to a gap
                     cv2.line(out, pts[a], pts[b], COLOR_SKELETON, 2, cv2.LINE_AA)
 
         return out
