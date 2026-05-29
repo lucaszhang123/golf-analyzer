@@ -742,3 +742,16 @@ def run_fault_detection(
         top_frame=phases.get("top_idx", 0),
         impact_frame=phases.get("impact_idx", 0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Club groups — used by main.py for CLI help text
+# ---------------------------------------------------------------------------
+CLUB_GROUPS = {
+    "driver": "driver",
+    "3w": "iron_long", "5w": "iron_long", "7w": "iron_long",
+    "hybrid": "iron_long", "2i": "iron_long", "3i": "iron_long",
+    "4i": "iron_mid", "5i": "iron_mid", "6i": "iron_mid", "7i": "iron_mid",
+    "8i": "iron_short", "9i": "iron_short",
+    "pw": "iron_short", "gw": "iron_short", "sw": "iron_short", "lw": "iron_short",
+}

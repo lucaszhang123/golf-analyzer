@@ -19,7 +19,6 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 from .metrics_back import BackMetrics, extract_back_metrics
-from .fault_rules_back import BACK_FAULT_CHECKS, BackFaultResult, _arrays, _find_phases, _smooth
 from .annotator import VideoAnnotator
 from .stick_figure import (
     draw_stick_figure, draw_metrics_minimal, draw_frame_label,
@@ -89,7 +88,7 @@ class BackSnapshot:
 @dataclass
 class BackReport:
     """Fault report for DTL analysis."""
-    faults: List[BackFaultResult] = field(default_factory=list)
+    faults: list = field(default_factory=list)
     address_frame: int = 0
     top_frame: int = 0
     impact_frame: int = 0

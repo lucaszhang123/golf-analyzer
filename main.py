@@ -36,7 +36,7 @@ import json
 import sys
 from pathlib import Path
 
-from core.fault_rules import CLUB_GROUPS
+from core.fault_engine import CLUB_GROUPS
 
 
 def parse_args():
@@ -305,6 +305,7 @@ def main():
         print("BACK VIEW — capture")
         print("=" * 60)
         capture_back(args, back_path, session_dir, stick_mode)
+
     write_session_manifest(session_dir, args, face_path, back_path)
 
     print("\n" + "=" * 60)
