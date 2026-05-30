@@ -39,6 +39,13 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 
+try:
+    from .phase_align import PhaseAligner
+    _ALIGNER_AVAILABLE = True
+except ImportError:
+    PhaseAligner = None
+    _ALIGNER_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Result container
@@ -79,14 +86,54 @@ def _smooth(arr: np.ndarray, w: int = 3) -> np.ndarray:
     return np.convolve(arr, np.ones(w) / w, mode="same")
 
 
+def _phases_to_dict(p: dict) -> dict:
+    """Serialize phase dict for JSON output — split ranges into [start, end]."""
+    out = {
+        "address_frame":        p.get("addr_idx"),
+        "top_frame":            p.get("top_idx"),
+        "impact_frame":         p.get("impact_idx"),
+        "backswing_range":      list(p.get("backswing_range",      (0, 0))),
+        "downswing_range":      list(p.get("downswing_range",      (0, 0))),
+        "followthrough_range":  list(p.get("followthrough_range",  (0, 0))),
+        "impact_signals":       p.get("_impact_signals"),
+    }
+    return out
+
+
 def _detect_phases(metrics: list) -> Dict[str, int]:
     """
-    Returns dict with addr_idx, top_idx, impact_idx.
-    Works with both SwingMetrics and BackMetrics.
+    Returns dict with addr_idx, top_idx, impact_idx plus phase RANGES:
+      address_range, backswing_range, downswing_range, followthrough_range
+    Each range is (start_frame, end_frame_exclusive).
+
+    Address is a single frame (the most stable frame in the first third).
+    Backswing spans (address+1, top].
+    Top is a single frame.
+    Downswing spans (top+1, impact].
+    Impact is a single frame.
+    Follow-through spans (impact+1, end).
+
+    IMPACT DETECTION (multi-signal):
+      Three independent signals vote on the impact frame. If at least 2
+      agree within +/-3 frames, that consensus is impact. Otherwise the
+      rotation-only estimate is the fallback.
+
+      Signal A — shoulder rotation drops to <55% of its top value
+                 (shoulders unwinding through the ball)
+      Signal B — hand velocity peak and subsequent rapid deceleration
+                 (clubhead/hands at max speed at impact)
+      Signal C — hand height returns to within 60% of the address→top arc
+                 (hands back down near where they started)
     """
     n = len(metrics)
     if n == 0:
-        return {"addr_idx": 0, "top_idx": 0, "impact_idx": 0}
+        return {
+            "addr_idx": 0, "top_idx": 0, "impact_idx": 0,
+            "address_range": (0, 1),
+            "backswing_range": (0, 0),
+            "downswing_range": (0, 0),
+            "followthrough_range": (0, 0),
+        }
 
     conf     = np.array([m.confidence for m in metrics])
     hand_y   = np.array([getattr(m, "hand_height_y", 0) or 0.0 for m in metrics])
@@ -94,8 +141,9 @@ def _detect_phases(metrics: list) -> Dict[str, int]:
     shoulder = np.array([getattr(m, "shoulder_rotation_deg", 0) or 0.0 for m in metrics])
     weight_s = _smooth(weight, 3)
     shld_s   = _smooth(shoulder, max(3, n // 15))
+    hand_s   = _smooth(hand_y, max(3, n // 20))
 
-    # Address
+    # ─── ADDRESS ────────────────────────────────────────────────────────────
     cutoff = max(3, n // 3)
     win    = max(2, n // 20)
     addr   = 0
@@ -107,11 +155,12 @@ def _detect_phases(metrics: list) -> Dict[str, int]:
             best_v = v
             addr   = i + win // 2
 
-    # Top — hand height minimum, validated against rotation peak
+    # ─── TOP OF BACKSWING (multi-signal) ────────────────────────────────────
     s_start = addr + 1
     s_end   = min(n, addr + int((n - addr) * 0.80))
+
     top_hand = addr + 1
-    if np.any(hand_y[s_start:s_end] > 0):
+    if s_end > s_start and np.any(hand_y[s_start:s_end] > 0):
         region = hand_y[s_start:s_end]
         c_reg  = conf[s_start:s_end]
         masked = np.where(c_reg > 0.4, region, np.max(region) + 1)
@@ -133,18 +182,100 @@ def _detect_phases(metrics: list) -> Dict[str, int]:
         top = top_rot
     top = min(top, int(n * 0.75))
 
-    # Impact — rotation drop
-    impact = top + max(1, int((n - top) * 0.50))
+    # ─── IMPACT (multi-signal — three independent estimates) ─────────────────
+    # Search window: after top, before end (capped at 95%)
+    search_lo = top + 1
+    search_hi = max(top + 2, int(n * 0.95))
+
+    # Signal A — shoulder rotation drops to < 55% of value at top
     rot_at_top = float(shld_s[top]) if top < n else 0.0
+    impact_rot = None
     if rot_at_top > 5:
         thresh = rot_at_top * 0.55
-        for i in range(top + 1, n):
+        for i in range(search_lo, search_hi):
             if shld_s[i] < thresh and conf[i] > 0.4:
-                impact = i
+                impact_rot = i
                 break
+
+    # Signal B — hand velocity peak + deceleration
+    # Velocity = frame-to-frame change in hand_y (vertical) — magnitude only.
+    # Hands accelerate through downswing, peak near impact, decelerate after.
+    impact_vel = None
+    if search_hi > search_lo + 2:
+        vy = np.abs(np.diff(hand_s))  # length n-1
+        vy_window = vy[max(0, search_lo-1):search_hi]
+        if len(vy_window) > 3:
+            peak_off = int(np.argmax(vy_window))
+            peak_frame = max(0, search_lo - 1) + peak_off
+            # After peak, look for first frame where velocity drops below
+            # 60% of peak value — that's the deceleration point ~= impact
+            peak_val = float(vy_window[peak_off])
+            if peak_val > 1.0:  # at least some motion
+                for j in range(peak_frame + 1, min(n - 1, search_hi)):
+                    if vy[j] < peak_val * 0.6 and conf[j] > 0.4:
+                        impact_vel = j
+                        break
+                if impact_vel is None:
+                    # No clear drop — use peak itself as impact estimate
+                    impact_vel = peak_frame + 1
+
+    # Signal C — hand height returns 60% of the way from top to address
+    impact_hand = None
+    top_h = float(hand_s[top]) if top < n else 0.0
+    arc_size = addr_h - top_h
+    if arc_size > 20:  # only if hands actually moved
+        target_h = top_h + arc_size * 0.60
+        for i in range(search_lo, search_hi):
+            if hand_s[i] >= target_h and conf[i] > 0.4:
+                impact_hand = i
+                break
+
+    # ─── CONSENSUS ───────────────────────────────────────────────────────────
+    candidates = [c for c in (impact_rot, impact_vel, impact_hand) if c is not None]
+
+    if len(candidates) >= 2:
+        # Look for any pair within +/-3 frames of each other.
+        # If found, average them. If all three agree, use the median.
+        candidates.sort()
+        if len(candidates) == 3 and (candidates[2] - candidates[0]) <= 6:
+            impact = int(round(np.median(candidates)))
+        else:
+            best_pair = None
+            best_spread = 999
+            for i in range(len(candidates)):
+                for j in range(i+1, len(candidates)):
+                    spread = candidates[j] - candidates[i]
+                    if spread <= 3 and spread < best_spread:
+                        best_pair = (candidates[i], candidates[j])
+                        best_spread = spread
+            if best_pair:
+                impact = int(round((best_pair[0] + best_pair[1]) / 2))
+            else:
+                # No consensus — fall back to rotation signal (most reliable single)
+                impact = impact_rot if impact_rot is not None else candidates[0]
+    elif len(candidates) == 1:
+        impact = candidates[0]
+    else:
+        # No signal fired — geometric fallback
+        impact = top + max(1, int((n - top) * 0.50))
+
     impact = min(max(impact, top + 1), int(n * 0.95))
 
-    return {"addr_idx": addr, "top_idx": top, "impact_idx": impact}
+    # ─── PHASE RANGES ────────────────────────────────────────────────────────
+    return {
+        "addr_idx":             addr,
+        "top_idx":              top,
+        "impact_idx":           impact,
+        "address_range":        (max(0, addr-2), min(n, addr+3)),
+        "backswing_range":      (addr + 1, top + 1),
+        "downswing_range":      (top + 1, impact + 1),
+        "followthrough_range":  (impact + 1, n),
+        "_impact_signals": {
+            "rotation": impact_rot,
+            "velocity": impact_vel,
+            "hand_return": impact_hand,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +380,19 @@ class FaultEngine:
         self.fc = _get(self.face, "confidence") if self.face else np.array([])
         self.bc = _get(self.back, "confidence") if self.back else np.array([])
 
+        # Build cross-view aligner when both streams are present.
+        # Allows individual fault checks to opt into reconcile_metric()
+        # for cross-view validation without disrupting single-view logic.
+        self.aligner = None
+        if _ALIGNER_AVAILABLE and self.face and self.back:
+            try:
+                self.aligner = PhaseAligner(
+                    face_metrics=self.face,
+                    back_metrics=self.back,
+                )
+            except Exception:
+                self.aligner = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -283,16 +427,40 @@ class FaultEngine:
         phases_f = self.fp
         phases_b = self.bp
 
+        def _ph_line(p, label):
+            if not p or p.get("addr_idx", 0) == p.get("impact_idx", 0):
+                return f"{label} : no swing detected"
+            sig = p.get("_impact_signals", {})
+            sig_str = (f"  (impact signals: rot={sig.get('rotation')}, "
+                       f"vel={sig.get('velocity')}, hand={sig.get('hand_return')})"
+                       if sig else "")
+            return (
+                f"{label} | "
+                f"address f{p['addr_idx']}  |  "
+                f"backswing f{p['backswing_range'][0]}-{p['backswing_range'][1]-1}  |  "
+                f"top f{p['top_idx']}  |  "
+                f"downswing f{p['downswing_range'][0]}-{p['downswing_range'][1]-1}  |  "
+                f"impact f{p['impact_idx']}  |  "
+                f"follow-through f{p['followthrough_range'][0]}-{p['followthrough_range'][1]-1}"
+                + sig_str
+            )
+
         lines = [
             "",
             "Swing Fault Report",
             "=" * 50,
-            f"Face phases : address={phases_f['addr_idx']}  "
-            f"top={phases_f['top_idx']}  impact={phases_f['impact_idx']}",
-            f"Back phases : address={phases_b['addr_idx']}  "
-            f"top={phases_b['top_idx']}  impact={phases_b['impact_idx']}",
+            _ph_line(phases_f, "Face"),
+            _ph_line(phases_b, "Back"),
             "",
         ]
+
+        if self.aligner is not None and self.aligner.is_aligned():
+            q = self.aligner.quality
+            lines.append(
+                f"Cross-view alignment: confidence={q.confidence:.0%}  "
+                f"fps_ratio(back/face)={q.fps_ratio:.2f}"
+            )
+            lines.append("")
 
         if not results:
             lines.append("No significant faults detected.")
@@ -316,10 +484,47 @@ class FaultEngine:
 
     def to_dict(self) -> dict:
         return {
-            "faults": [r.to_dict() for r in self.detect()],
-            "phases_face": self.fp,
-            "phases_back": self.bp,
+            "faults":      [r.to_dict() for r in self.detect()],
+            "phases_face": _phases_to_dict(self.fp),
+            "phases_back": _phases_to_dict(self.bp),
         }
+
+    def phase_range(self, name: str, view: str = "face") -> tuple:
+        """
+        Return (start, end_exclusive) frame range for a named phase.
+        name : "address" | "backswing" | "downswing" | "impact" | "follow_through"
+        view : "face" | "back"
+        """
+        p = self.fp if view == "face" else self.bp
+        key_map = {
+            "address":        "address_range",
+            "backswing":      "backswing_range",
+            "downswing":      "downswing_range",
+            "follow_through": "followthrough_range",
+        }
+        if name in key_map:
+            return p.get(key_map[name], (0, 0))
+        if name == "impact":
+            idx = p.get("impact_idx", 0)
+            return (max(0, idx-2), idx + 3)
+        return (0, 0)
+
+    # ------------------------------------------------------------------
+    # Cross-view reconciliation helper (uses PhaseAligner when available)
+    # ------------------------------------------------------------------
+    def reconcile(self, attr: str, face_frame_idx: int, prefer: str = "auto"):
+        """
+        Return the best estimate for `attr` at the given face frame,
+        drawing from whichever view has higher landmark confidence at
+        the corresponding biomechanical moment. Falls back to face-only
+        when alignment is unavailable.
+        """
+        if self.aligner is not None and self.aligner.is_aligned():
+            return self.aligner.reconcile_metric(attr, face_frame_idx, prefer=prefer)
+        # Single-view fallback
+        if self.face and 0 <= face_frame_idx < len(self.face):
+            return getattr(self.face[face_frame_idx], attr, None)
+        return None
 
     # ------------------------------------------------------------------
     # Fault 1a: Spine angle change — BACKSWING
@@ -1022,6 +1227,10 @@ class FaultReport:
     address_frame: int = 0
     top_frame: int = 0
     impact_frame: int = 0
+    backswing_range: tuple = (0, 0)
+    downswing_range: tuple = (0, 0)
+    followthrough_range: tuple = (0, 0)
+    impact_signals: Optional[dict] = None
 
     # FeedbackGenerator reads .faults[i].display_name / severity_label /
     # severity / phase / measured_value / elite_benchmark / description /
@@ -1081,6 +1290,10 @@ def run_fault_detection(
         address_frame=phases.get("addr_idx", 0),
         top_frame=phases.get("top_idx", 0),
         impact_frame=phases.get("impact_idx", 0),
+        backswing_range=phases.get("backswing_range", (0, 0)),
+        downswing_range=phases.get("downswing_range", (0, 0)),
+        followthrough_range=phases.get("followthrough_range", (0, 0)),
+        impact_signals=phases.get("_impact_signals"),
     )
 
 

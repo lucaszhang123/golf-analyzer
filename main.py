@@ -179,7 +179,8 @@ def capture_face(args, video_path, session_dir, stick_mode):
             print(f"Stick video : {stick_path}")
             print(f"Stick frames: {frames_dir}/")
 
-        all_metrics = getattr(analyzer, "_last_metrics", [s.metrics for s in result.snapshots])
+        all_metrics   = getattr(analyzer, "_last_metrics",  [s.metrics for s in result.snapshots])
+        all_landmarks = getattr(analyzer, "_last_landmarks", [])
 
     dump_metrics(
         view="face",
@@ -199,7 +200,14 @@ def capture_face(args, video_path, session_dir, stick_mode):
         print(f"  Annotated   : {result.annotated_video_path}")
     print(f"  Metrics     : {out_dir / 'metrics.json'}")
 
-    return result
+    # Capture frame dimensions for reconciler
+    import cv2
+    cap = cv2.VideoCapture(str(video_path))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    return result, all_landmarks, all_metrics, w, h
 
 
 def capture_back(args, video_path, session_dir, stick_mode):
@@ -229,7 +237,8 @@ def capture_back(args, video_path, session_dir, stick_mode):
             out_dir=str(out_dir),
             run_faults=False,
         )
-        all_metrics = getattr(analyzer, "_last_metrics", [s.metrics for s in result.snapshots])
+        all_metrics   = getattr(analyzer, "_last_metrics",  [s.metrics for s in result.snapshots])
+        all_landmarks = getattr(analyzer, "_last_landmarks", [])
 
     dump_metrics(
         view="back",
@@ -253,7 +262,13 @@ def capture_back(args, video_path, session_dir, stick_mode):
         print(f"  Stick frames: {frames_dir}/")
     print(f"  Metrics     : {out_dir / 'metrics.json'}")
 
-    return result
+    import cv2
+    cap = cv2.VideoCapture(str(video_path))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    return result, all_landmarks, all_metrics, w, h
 
 
 def write_session_manifest(session_dir, args, face_path, back_path):
@@ -294,19 +309,53 @@ def main():
     print("(No fault detection in this step — run `python3 faults.py "
           f"{session_dir}/` to analyze.)\n")
 
+    face_data = None
+    back_data = None
+
     if face_path:
         print("=" * 60)
         print("FACE VIEW — capture")
         print("=" * 60)
-        capture_face(args, face_path, session_dir, stick_mode)
+        face_data = capture_face(args, face_path, session_dir, stick_mode)
 
     if back_path:
         print("\n" + "=" * 60)
         print("BACK VIEW — capture")
         print("=" * 60)
-        capture_back(args, back_path, session_dir, stick_mode)
+        back_data = capture_back(args, back_path, session_dir, stick_mode)
 
     write_session_manifest(session_dir, args, face_path, back_path)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Cross-view landmark reconciliation (only when both views captured)
+    # ──────────────────────────────────────────────────────────────────────
+    if face_data is not None and back_data is not None:
+        print("\n" + "=" * 60)
+        print("CROSS-VIEW LANDMARK RECONCILIATION")
+        print("=" * 60)
+        try:
+            from core.phase_align import PhaseAligner
+            from core.landmark_reconciler import LandmarkReconciler
+
+            face_result, face_lms, face_metrics, fw, fh = face_data
+            back_result, back_lms, back_metrics, bw, bh = back_data
+
+            aligner = PhaseAligner(face_metrics=face_metrics, back_metrics=back_metrics)
+            print(aligner.quality.summary())
+
+            reconciler = LandmarkReconciler(
+                face_landmarks=face_lms,
+                back_landmarks=back_lms,
+                aligner=aligner,
+                face_w=fw, face_h=fh,
+                back_w=bw, back_h=bh,
+            )
+            reconciler.save_json(
+                str(session_dir / "reconciled_landmarks.json"),
+                verbose=True,
+            )
+        except Exception as e:
+            print(f"  Reconciliation skipped: {e}")
 
     print("\n" + "=" * 60)
     print(f"Capture complete. Session: {session_dir}/")
